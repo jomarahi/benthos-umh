@@ -491,11 +491,11 @@ func (s *sparkplugOutput) onConnect(client mqtt.Client) {
 		s.logger.Info("Successfully published BIRTH message")
 	}
 
-	// Subscribe to node rebirth commands (NCMD) 
+	// Subscribe to node rebirth commands (NCMD)
 	// Edge Nodes must listen for rebirth requests from Host applications
 	ncmdTopic := fmt.Sprintf("spBv1.0/%s/NCMD/%s", s.config.Identity.GroupID, s.config.Identity.EdgeNodeID)
 	s.logger.Infof("Subscribing to node rebirth commands on topic: %s", ncmdTopic)
-	
+
 	token := client.Subscribe(ncmdTopic, 1, s.handleRebirthCommand)
 	if token.Wait() && token.Error() != nil {
 		s.logger.Errorf("Failed to subscribe to rebirth commands: %v", token.Error())
@@ -553,7 +553,7 @@ func (s *sparkplugOutput) handleRebirthCommand(client mqtt.Client, msg mqtt.Mess
 	rebirthRequested := false
 	for _, metric := range payload.Metrics {
 		isRebirthMetric := false
-		
+
 		// Check named metric first (spec compliant approach)
 		if metric.Name != nil && *metric.Name == "Node Control/Rebirth" {
 			isRebirthMetric = true
@@ -562,11 +562,11 @@ func (s *sparkplugOutput) handleRebirthCommand(client mqtt.Client, msg mqtt.Mess
 			// Alias 1 is reserved for "Node Control/Rebirth" in NBIRTH
 			isRebirthMetric = true
 		}
-		
+
 		// If this is a rebirth metric with boolean true value
 		if isRebirthMetric && metric.GetBooleanValue() {
 			rebirthRequested = true
-			s.logger.Infof("Found rebirth request - name: %v, alias: %v, boolean: %v", 
+			s.logger.Infof("Found rebirth request - name: %v, alias: %v, boolean: %v",
 				metric.Name, metric.Alias, metric.GetBooleanValue())
 			break
 		}
@@ -598,7 +598,7 @@ func (s *sparkplugOutput) handleRebirthCommand(client mqtt.Client, msg mqtt.Mess
 	s.deviceStateMu.Lock()
 	// Reset device state to allow DBIRTH republishing
 	s.seenDevices = make(map[string]bool)
-	
+
 	// Collect known devices
 	knownDevices := make([]string, 0, len(s.deviceMetrics))
 	for deviceID := range s.deviceMetrics {
@@ -611,12 +611,12 @@ func (s *sparkplugOutput) handleRebirthCommand(client mqtt.Client, msg mqtt.Mess
 	// Publish DBIRTH for all known devices immediately
 	for _, deviceID := range knownDevices {
 		s.logger.Infof("Publishing DBIRTH for device '%s' after rebirth", deviceID)
-		
+
 		// Get all cached metrics for this device
 		s.deviceStateMu.RLock()
 		deviceCache := s.deviceMetrics[deviceID]
 		s.deviceStateMu.RUnlock()
-		
+
 		// Convert cached metrics to format expected by getAllDeviceMetrics
 		allDeviceMetrics := make(map[string]interface{})
 		if s.deviceLastValues != nil {
@@ -628,13 +628,13 @@ func (s *sparkplugOutput) handleRebirthCommand(client mqtt.Client, msg mqtt.Mess
 			}
 			s.deviceStateMu.RUnlock()
 		}
-		
+
 		// If we have cached metrics but no last values, use empty data to trigger DBIRTH
 		if len(deviceCache) > 0 && len(allDeviceMetrics) == 0 {
 			// Use empty metrics map to get all known metrics for DBIRTH
 			allDeviceMetrics = s.getAllDeviceMetrics(deviceID, make(map[string]interface{}))
 		}
-		
+
 		if len(allDeviceMetrics) > 0 {
 			if err := s.publishDBIRTH(deviceID, allDeviceMetrics); err != nil {
 				s.logger.Errorf("Failed to publish DBIRTH for device '%s' after rebirth: %v", deviceID, err)
@@ -648,7 +648,7 @@ func (s *sparkplugOutput) handleRebirthCommand(client mqtt.Client, msg mqtt.Mess
 			s.logger.Warnf("No metrics found for device '%s', skipping DBIRTH after rebirth", deviceID)
 		}
 	}
-	
+
 	s.logger.Infof("Completed rebirth - published DBIRTH for %d devices", len(knownDevices))
 }
 
@@ -710,6 +710,11 @@ nbirthReady:
 			"Message metadata: %+v",
 			len(s.metrics), s.autoExtractTagName, structured, allMeta)
 		return nil
+	}
+
+	// Prime metric type cache using metadata (e.g., OPC UA datatype) before alias assignment
+	for metricName, value := range data {
+		s.resolveMetricType(metricName, value, msg)
 	}
 
 	// Phase 3: Device-level PARRIS implementation
@@ -1045,7 +1050,7 @@ func (s *sparkplugOutput) publishDBIRTH(deviceID string, data map[string]interfa
 		} else {
 			metric.IsNull = func() *bool { b := true; return &b }()
 		}
-		
+
 		s.setDBirthMetricTimestamp(metric)
 		metrics = append(metrics, metric)
 	}
@@ -1186,7 +1191,7 @@ func (s *sparkplugOutput) publishBirthMessage() error {
 		} else {
 			metric.IsNull = func() *bool { b := true; return &b }()
 		}
-		
+
 		s.setDBirthMetricTimestamp(metric)
 		metrics = append(metrics, metric)
 	}
@@ -1473,7 +1478,7 @@ func (s *sparkplugOutput) setMetricValue(metric *sparkplugb.Payload_Metric, valu
 func (s *sparkplugOutput) setMetricTimestamp(metric *sparkplugb.Payload_Metric, msg *service.Message) {
 	// Get current timestamp in milliseconds
 	timestamp := uint64(time.Now().UnixMilli())
-	
+
 	// Check for timestamp_ms in the message payload first (UMH-Core format)
 	if structured, err := msg.AsStructured(); err == nil {
 		if structMap, ok := structured.(map[string]interface{}); ok {
@@ -1497,7 +1502,7 @@ func (s *sparkplugOutput) setMetricTimestamp(metric *sparkplugb.Payload_Metric, 
 			}
 		}
 	}
-	
+
 	// Direct field assignment using the complete protobuf definition
 	metric.Timestamp = &timestamp
 	s.logger.Debugf("Set metric timestamp: %d", timestamp)
@@ -1506,7 +1511,7 @@ func (s *sparkplugOutput) setMetricTimestamp(metric *sparkplugb.Payload_Metric, 
 // setDBirthMetricTimestamp sets the timestamp field on a DBIRTH metric using current time
 func (s *sparkplugOutput) setDBirthMetricTimestamp(metric *sparkplugb.Payload_Metric) {
 	timestamp := uint64(time.Now().UnixMilli())
-	
+
 	// Direct field assignment using the complete protobuf definition
 	metric.Timestamp = &timestamp
 }
@@ -1629,6 +1634,128 @@ func (s *sparkplugOutput) convertToString(value interface{}) (string, bool) {
 	}
 }
 
+// resolveMetricType determines the Sparkplug metric type for a metric name, preferring metadata hints.
+// Currently this is used to honor OPC UA datatype metadata so floats don't get inferred as integers
+// when the first sample happens to be a whole number.
+func (s *sparkplugOutput) resolveMetricType(metricName string, value interface{}, msg *service.Message) string {
+	s.stateMu.RLock()
+	if existing, ok := s.metricTypes[metricName]; ok && existing != "" {
+		s.stateMu.RUnlock()
+		return existing
+	}
+	s.stateMu.RUnlock()
+
+	// Try OPC UA datatype metadata first
+	if msg != nil {
+		if opcuaType, ok := msg.MetaGet("opcua_attr_datatype"); ok {
+			if mapped := mapOpcuaDataTypeToSparkplug(opcuaType); mapped != "" {
+				s.stateMu.Lock()
+				s.metricTypes[metricName] = mapped
+				s.stateMu.Unlock()
+				return mapped
+			}
+		}
+		if spbType, ok := msg.MetaGet("spb_datatype"); ok {
+			if mapped := mapSpbDatatypeMetaToSparkplug(spbType); mapped != "" {
+				s.stateMu.Lock()
+				s.metricTypes[metricName] = mapped
+				s.stateMu.Unlock()
+				return mapped
+			}
+		}
+	}
+
+	inferred := s.typeConverter.InferMetricType(value)
+	s.stateMu.Lock()
+	s.metricTypes[metricName] = inferred
+	s.stateMu.Unlock()
+	return inferred
+}
+
+// mapOpcuaDataTypeToSparkplug translates OPC UA datatype strings into Sparkplug type names.
+func mapOpcuaDataTypeToSparkplug(opcuaType string) string {
+	switch strings.ToLower(opcuaType) {
+	case "float", "float32":
+		return "float"
+	case "double", "float64":
+		return "double"
+	case "bool", "boolean":
+		return "boolean"
+	case "string":
+		return "string"
+	case "sbyte", "int8":
+		return "int8"
+	case "int16":
+		return "int16"
+	case "int32":
+		return "int32"
+	case "int64":
+		return "int64"
+	case "byte", "uint8":
+		return "uint8"
+	case "uint16":
+		return "uint16"
+	case "uint32":
+		return "uint32"
+	case "uint64":
+		return "uint64"
+	default:
+		return ""
+	}
+}
+
+// mapSpbDatatypeMetaToSparkplug resolves spb_datatype metadata (name or numeric id) to type names.
+func mapSpbDatatypeMetaToSparkplug(spbType string) string {
+	trimmed := strings.TrimSpace(spbType)
+
+	// Try numeric ID first
+	if id, err := strconv.ParseUint(trimmed, 10, 32); err == nil {
+		return map[uint64]string{
+			1:  "int8",
+			2:  "int16",
+			3:  "int32",
+			4:  "int64",
+			5:  "uint8",
+			6:  "uint16",
+			7:  "uint32",
+			8:  "uint64",
+			9:  "float",
+			10: "double",
+			11: "boolean",
+			12: "string",
+		}[id]
+	}
+
+	switch strings.ToLower(trimmed) {
+	case "int8", "sbyte":
+		return "int8"
+	case "int16":
+		return "int16"
+	case "int32":
+		return "int32"
+	case "int64", "long":
+		return "int64"
+	case "uint8", "byte":
+		return "uint8"
+	case "uint16":
+		return "uint16"
+	case "uint32":
+		return "uint32"
+	case "uint64", "ulong":
+		return "uint64"
+	case "float", "float32":
+		return "float"
+	case "double", "float64":
+		return "double"
+	case "boolean", "bool":
+		return "boolean"
+	case "string", "text":
+		return "string"
+	default:
+		return ""
+	}
+}
+
 // P5 Dynamic Alias Implementation - Helper Methods
 
 // detectNewMetrics identifies metrics that don't have aliases and need dynamic assignment
@@ -1667,13 +1794,21 @@ func (s *sparkplugOutput) assignDynamicAliases(newMetrics []string, data map[str
 
 	for _, metricName := range newMetrics {
 		// Assign alias
-		s.metricAliases[metricName] = s.nextAlias
-		s.nextAlias++
+		if _, exists := s.metricAliases[metricName]; !exists {
+			s.metricAliases[metricName] = s.nextAlias
+			s.nextAlias++
+		}
 
-		// Infer type from value
-		value := data[metricName]
-		metricType := s.typeConverter.InferMetricType(value)
-		s.metricTypes[metricName] = metricType
+		metricType := s.metricTypes[metricName]
+		if metricType == "" {
+			if value, ok := data[metricName]; ok {
+				metricType = s.typeConverter.InferMetricType(value)
+				s.metricTypes[metricName] = metricType
+			} else {
+				metricType = "double" // safe default if value is missing
+				s.metricTypes[metricName] = metricType
+			}
+		}
 
 		s.logger.Infof("Assigned dynamic alias %d to metric '%s' (type: %s)",
 			s.metricAliases[metricName], metricName, metricType)
