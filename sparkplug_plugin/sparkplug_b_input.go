@@ -882,6 +882,10 @@ func (s *sparkplugInput) createMessageFromMetric(metric *sparkplugb.Payload_Metr
 		msg.MetaSet("spb_is_historical", fmt.Sprintf("%t", *metric.IsHistorical))
 	}
 
+	// Added 15.12.2025 Jørgen Antonsen
+	if metric.Timestamp != nil {
+		msg.MetaSet("spb_metric_timestamp", fmt.Sprintf("%d", *metric.Timestamp))
+	}
 	// Add birth-death sequence if available from node state
 	s.stateMu.RLock()
 	if state, exists := s.nodeStates[deviceKey]; exists {
