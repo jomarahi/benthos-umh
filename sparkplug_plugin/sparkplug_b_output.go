@@ -141,7 +141,10 @@ and then publishes DATA messages as Benthos messages flow through the pipeline.`
 				Default(true),
 			service.NewBoolField("retain_last_values").
 				Description("Whether to retain last known values for BIRTH messages after reconnection").
-				Default(true)).
+				Default(true),
+			service.NewDurationField("dbirth_buffer").
+				Description("Buffer time before publishing DBIRTH when new metrics are discovered, to batch multiple BIRTH messages (set to 0 to disable)").
+				Default("500ms")).
 			Description("Processing behavior configuration").
 			Optional())
 
@@ -167,11 +170,18 @@ type MetricConfig struct {
 	ValueFrom string `json:"value_from"`
 }
 
+type dbirthBufferState struct {
+	data       map[string]interface{}
+	targetTime time.Time
+	timer      *time.Timer
+}
+
 type sparkplugOutput struct {
 	config             Config
 	metrics            []MetricConfig
 	autoExtractTagName bool
 	retainLastValues   bool
+	birthBuffer        time.Duration
 	logger             *service.Logger
 
 	// MQTT client and state
@@ -200,6 +210,10 @@ type sparkplugOutput struct {
 	seenDevices   map[string]bool              // Track devices published in this session
 	deviceMetrics map[string]map[string]uint64 // Cache metrics per device (device_id -> metric_name -> alias)
 	deviceStateMu sync.RWMutex                 // Thread safety for device state
+
+	// Buffered DBIRTH handling to batch multiple new metrics after restart
+	pendingBirths   map[string]*dbirthBufferState
+	pendingBirthsMu sync.Mutex
 
 	// NBIRTH synchronization to prevent DBIRTH before NBIRTH
 	//
@@ -303,6 +317,7 @@ func newSparkplugOutput(conf *service.ParsedConfig, mgr *service.Resources) (*sp
 
 	// Parse behaviour section using namespace (optional)
 	var autoExtractTagName, retainLastValues bool
+	var birthBuffer time.Duration
 	if conf.Contains("behaviour") {
 		behaviourConf := conf.Namespace("behaviour")
 		autoExtractTagName, err = behaviourConf.FieldBool("auto_extract_tag_name")
@@ -313,10 +328,15 @@ func newSparkplugOutput(conf *service.ParsedConfig, mgr *service.Resources) (*sp
 		if err != nil {
 			retainLastValues = true // default
 		}
+		birthBuffer, err = behaviourConf.FieldDuration("dbirth_buffer")
+		if err != nil {
+			birthBuffer = 500 * time.Millisecond
+		}
 	} else {
 		// Use defaults
 		autoExtractTagName = true
 		retainLastValues = true
+		birthBuffer = 500 * time.Millisecond
 	}
 
 	// Parse metric configurations (optional)
@@ -394,6 +414,7 @@ func newSparkplugOutput(conf *service.ParsedConfig, mgr *service.Resources) (*sp
 		metrics:            metrics,
 		autoExtractTagName: autoExtractTagName,
 		retainLastValues:   retainLastValues,
+		birthBuffer:        birthBuffer,
 		logger:             mgr.Logger(),
 		bdSeq:              bdSeq,
 		seqCounter:         0,
@@ -407,6 +428,7 @@ func newSparkplugOutput(conf *service.ParsedConfig, mgr *service.Resources) (*sp
 		// Device-level PARRIS state initialization
 		seenDevices:   make(map[string]bool),
 		deviceMetrics: make(map[string]map[string]uint64),
+		pendingBirths: make(map[string]*dbirthBufferState),
 
 		mqttClientBuilder: NewMQTTClientBuilder(mgr),
 		messagesPublished: mgr.Metrics().NewCounter("messages_published"),
@@ -721,25 +743,35 @@ nbirthReady:
 	deviceID := s.getParrisDeviceID(msg)
 
 	// Check if we need to publish DBIRTH (first time OR new metrics discovered)
+	isFirstDevice := s.isFirstTimeDevice(deviceID)
 	newMetricsFound := s.updateDeviceMetrics(deviceID, data)
 
-	if s.isFirstTimeDevice(deviceID) || newMetricsFound {
-		if s.isFirstTimeDevice(deviceID) {
+	if isFirstDevice || newMetricsFound {
+		if isFirstDevice {
 			s.logger.Infof("First message for device '%s', publishing DBIRTH", deviceID)
 		} else {
 			s.logger.Infof("New metrics discovered for device '%s', publishing updated DBIRTH", deviceID)
 		}
 
-		// Get all known metrics for this device for DBIRTH
-		allDeviceMetrics := s.getAllDeviceMetrics(deviceID, data)
+		// Capture latest values before queuing/publishing DBIRTH
+		s.storeDeviceLastValues(deviceID, data)
 
-		if err := s.publishDBIRTH(deviceID, allDeviceMetrics); err != nil {
+		published, err := s.bufferOrPublishDBirth(deviceID, data)
+		if err != nil {
 			s.logger.Errorf("Failed to publish DBIRTH for device '%s': %v", deviceID, err)
 			s.publishErrors.Incr(1)
 			return err
 		}
-		s.markDeviceSeen(deviceID)
-		s.birthsPublished.Incr(1)
+		if !published {
+			s.logger.Debugf("Buffered DBIRTH for device '%s' for %s to batch new metrics", deviceID, s.birthBuffer)
+			return nil
+		}
+	} else if s.isDeviceBirthBuffered(deviceID) {
+		// Keep buffered DBIRTH payload up-to-date and skip DATA until birth is sent
+		s.storeDeviceLastValues(deviceID, data)
+		s.refreshBufferedDBirth(deviceID, data)
+		s.logger.Debugf("DBIRTH for device '%s' is buffered; skipping DATA until publish completes", deviceID)
+		return nil
 	}
 
 	// Publish DATA message (DDATA if device, NDATA if node-level)
@@ -759,6 +791,16 @@ nbirthReady:
 func (s *sparkplugOutput) Close(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// Stop any buffered DBIRTH timers to avoid publishing after shutdown
+	s.pendingBirthsMu.Lock()
+	for _, state := range s.pendingBirths {
+		if state != nil && state.timer != nil {
+			state.timer.Stop()
+		}
+	}
+	s.pendingBirths = make(map[string]*dbirthBufferState)
+	s.pendingBirthsMu.Unlock()
 
 	if s.client != nil && s.client.IsConnected() {
 		// Publish DEATH message before disconnecting gracefully
@@ -870,6 +912,120 @@ func (s *sparkplugOutput) updateDeviceMetrics(deviceID string, data map[string]i
 	}
 
 	return newMetricsFound
+}
+
+func (s *sparkplugOutput) bufferOrPublishDBirth(deviceID string, data map[string]interface{}) (bool, error) {
+	allDeviceMetrics := s.getAllDeviceMetrics(deviceID, data)
+
+	if s.birthBuffer <= 0 {
+		if err := s.publishDBIRTH(deviceID, allDeviceMetrics); err != nil {
+			return false, err
+		}
+		s.markDeviceSeen(deviceID)
+		s.birthsPublished.Incr(1)
+		return true, nil
+	}
+
+	s.enqueueBufferedDBirth(deviceID, allDeviceMetrics)
+	return false, nil
+}
+
+func (s *sparkplugOutput) enqueueBufferedDBirth(deviceID string, data map[string]interface{}) {
+	targetTime := time.Now().Add(s.birthBuffer)
+
+	s.pendingBirthsMu.Lock()
+	defer s.pendingBirthsMu.Unlock()
+
+	state, exists := s.pendingBirths[deviceID]
+	if !exists {
+		state = &dbirthBufferState{}
+		s.pendingBirths[deviceID] = state
+	}
+
+	state.data = data
+	state.targetTime = targetTime
+
+	if state.timer == nil {
+		state.timer = time.AfterFunc(s.birthBuffer, func() {
+			s.flushBufferedDBirth(deviceID)
+		})
+	}
+}
+
+func (s *sparkplugOutput) isDeviceBirthBuffered(deviceID string) bool {
+	s.pendingBirthsMu.Lock()
+	defer s.pendingBirthsMu.Unlock()
+
+	_, exists := s.pendingBirths[deviceID]
+	return exists
+}
+
+func (s *sparkplugOutput) refreshBufferedDBirth(deviceID string, data map[string]interface{}) {
+	if s.birthBuffer <= 0 {
+		return
+	}
+
+	allDeviceMetrics := s.getAllDeviceMetrics(deviceID, data)
+
+	s.pendingBirthsMu.Lock()
+	defer s.pendingBirthsMu.Unlock()
+
+	state, exists := s.pendingBirths[deviceID]
+	if !exists {
+		return
+	}
+
+	state.data = allDeviceMetrics
+	state.targetTime = time.Now().Add(s.birthBuffer)
+
+	if state.timer == nil {
+		state.timer = time.AfterFunc(s.birthBuffer, func() {
+			s.flushBufferedDBirth(deviceID)
+		})
+	}
+}
+
+func (s *sparkplugOutput) flushBufferedDBirth(deviceID string) {
+	s.pendingBirthsMu.Lock()
+	state, exists := s.pendingBirths[deviceID]
+	if !exists {
+		s.pendingBirthsMu.Unlock()
+		return
+	}
+
+	now := time.Now()
+	if now.Before(state.targetTime) {
+		wait := time.Until(state.targetTime)
+		if wait < time.Millisecond {
+			wait = time.Millisecond
+		}
+
+		if state.timer == nil {
+			state.timer = time.AfterFunc(wait, func() {
+				s.flushBufferedDBirth(deviceID)
+			})
+		} else {
+			state.timer.Reset(wait)
+		}
+		s.pendingBirthsMu.Unlock()
+		return
+	}
+
+	data := state.data
+	if state.timer != nil {
+		state.timer.Stop()
+	}
+	delete(s.pendingBirths, deviceID)
+	s.pendingBirthsMu.Unlock()
+
+	if err := s.publishDBIRTH(deviceID, data); err != nil {
+		s.logger.Errorf("Failed to publish buffered DBIRTH for device '%s': %v", deviceID, err)
+		s.publishErrors.Incr(1)
+		return
+	}
+	s.markDeviceSeen(deviceID)
+	s.birthsPublished.Incr(1)
+	s.logger.Infof("Published buffered DBIRTH for device '%s' after %s", deviceID, s.birthBuffer)
 }
 
 // getAllDeviceMetrics returns all known metrics for a device (cached + current).

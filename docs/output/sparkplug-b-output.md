@@ -136,6 +136,9 @@ Each metric in the `metrics` array supports:
 |-------|------|---------|-------------|
 | `behaviour.auto_extract_tag_name` | `bool` | `true` | Whether to automatically extract tag_name from message metadata |
 | `behaviour.retain_last_values` | `bool` | `true` | Whether to retain last known values for BIRTH messages after reconnection |
+| `behaviour.dbirth_buffer` | `duration` | `"500ms"` | Wait time before publishing DBIRTH when new metrics are discovered (batches bursts after restart, set to `0s` to disable) |
+
+The DBIRTH buffer is useful when an Edge Node restarts and many tags report one-by-one: the plugin waits for the buffer window before sending DBIRTH so multiple new metrics are announced together instead of one BIRTH per value.
 
 
 
