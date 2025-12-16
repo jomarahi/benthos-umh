@@ -128,7 +128,7 @@ Each metric in the `metrics` array supports:
 | **type** | `string` | **yes** | Sparkplug B data type |
 | **value_from** | `string` | **yes** | JSON field name containing the value |
 | **units** | `string` | no | Engineering units (e.g., "°C", "bar") |
-| **is_historical** | `bool` | no | Whether this is historical data |
+| **is_historical** | `bool` | no | Whether this is historical data (automatically set to `true` when the metric timestamp exceeds the configured `behaviour.historical_age_threshold` at publish time; set threshold to `0s` to disable auto-flagging) |
 | **metadata** | `object` | no | Additional key-value metadata |
 
 ### Behaviour Section
@@ -138,6 +138,7 @@ Each metric in the `metrics` array supports:
 | `behaviour.use_aliases` | `bool` | `true` | Publish metrics using numeric aliases (false sends full metric names in every message) |
 | `behaviour.retain_last_values` | `bool` | `true` | Whether to retain last known values for BIRTH messages after reconnection |
 | `behaviour.dbirth_buffer` | `duration` | `"500ms"` | Wait time before publishing DBIRTH when new metrics are discovered (batches bursts after restart, set to `0s` to disable) |
+| `behaviour.historical_age_threshold` | `duration` | `"5m"` | Age threshold for auto-setting `is_historical`; set to `0s` to turn off automatic historical flagging |
 
 The DBIRTH buffer is useful when an Edge Node restarts and many tags report one-by-one: the plugin waits for the buffer window before sending DBIRTH so multiple new metrics are announced together instead of one BIRTH per value.
 

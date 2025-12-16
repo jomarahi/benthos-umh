@@ -147,7 +147,10 @@ and then publishes DATA messages as Benthos messages flow through the pipeline.`
 				Default(true),
 			service.NewDurationField("dbirth_buffer").
 				Description("Buffer time before publishing DBIRTH when new metrics are discovered, to batch multiple BIRTH messages (set to 0 to disable)").
-				Default("500ms")).
+				Default("500ms"),
+			service.NewDurationField("historical_age_threshold").
+				Description("Age threshold for automatically flagging metrics as historical. If 0, the automatic historical flagging is disabled").
+				Default("5m")).
 			Description("Processing behavior configuration").
 			Optional())
 
@@ -180,13 +183,14 @@ type dbirthBufferState struct {
 }
 
 type sparkplugOutput struct {
-	config             Config
-	metrics            []MetricConfig
-	autoExtractTagName bool
-	useAliases         bool
-	retainLastValues   bool
-	birthBuffer        time.Duration
-	logger             *service.Logger
+	config                 Config
+	metrics                []MetricConfig
+	autoExtractTagName     bool
+	useAliases             bool
+	retainLastValues       bool
+	birthBuffer            time.Duration
+	historicalAgeThreshold time.Duration
+	logger                 *service.Logger
 
 	// MQTT client and state
 	client mqtt.Client
@@ -321,7 +325,7 @@ func newSparkplugOutput(conf *service.ParsedConfig, mgr *service.Resources) (*sp
 
 	// Parse behaviour section using namespace (optional)
 	var autoExtractTagName, retainLastValues, useAliases bool
-	var birthBuffer time.Duration
+	var birthBuffer, historicalAgeThreshold time.Duration
 	if conf.Contains("behaviour") {
 		behaviourConf := conf.Namespace("behaviour")
 		autoExtractTagName, err = behaviourConf.FieldBool("auto_extract_tag_name")
@@ -340,12 +344,17 @@ func newSparkplugOutput(conf *service.ParsedConfig, mgr *service.Resources) (*sp
 		if err != nil {
 			birthBuffer = 500 * time.Millisecond
 		}
+		historicalAgeThreshold, err = behaviourConf.FieldDuration("historical_age_threshold")
+		if err != nil {
+			historicalAgeThreshold = 5 * time.Minute
+		}
 	} else {
 		// Use defaults
 		autoExtractTagName = true
 		useAliases = true
 		retainLastValues = true
 		birthBuffer = 500 * time.Millisecond
+		historicalAgeThreshold = 5 * time.Minute
 	}
 
 	// Parse metric configurations (optional)
@@ -419,22 +428,23 @@ func newSparkplugOutput(conf *service.ParsedConfig, mgr *service.Resources) (*sp
 	}
 
 	return &sparkplugOutput{
-		config:             config,
-		metrics:            metrics,
-		autoExtractTagName: autoExtractTagName,
-		useAliases:         useAliases,
-		retainLastValues:   retainLastValues,
-		birthBuffer:        birthBuffer,
-		logger:             mgr.Logger(),
-		bdSeq:              bdSeq,
-		seqCounter:         0,
-		metricAliases:      metricAliases,
-		metricTypes:        metricTypes,
-		lastValues:         make(map[string]interface{}),
-		deviceLastValues:   make(map[string]map[string]interface{}),
-		nextAlias:          nextAlias,
-		rebirthPending:     false,
-		rebirthDebounceMs:  5000, // 5 second debounce
+		config:                 config,
+		metrics:                metrics,
+		autoExtractTagName:     autoExtractTagName,
+		useAliases:             useAliases,
+		retainLastValues:       retainLastValues,
+		birthBuffer:            birthBuffer,
+		historicalAgeThreshold: historicalAgeThreshold,
+		logger:                 mgr.Logger(),
+		bdSeq:                  bdSeq,
+		seqCounter:             0,
+		metricAliases:          metricAliases,
+		metricTypes:            metricTypes,
+		lastValues:             make(map[string]interface{}),
+		deviceLastValues:       make(map[string]map[string]interface{}),
+		nextAlias:              nextAlias,
+		rebirthPending:         false,
+		rebirthDebounceMs:      5000, // 5 second debounce
 		// Device-level PARRIS state initialization
 		seenDevices:   make(map[string]bool),
 		deviceMetrics: make(map[string]map[string]uint64),
@@ -1337,7 +1347,7 @@ func (s *sparkplugOutput) publishBirthMessage() error {
 
 	// Add bdSeq metric (required by Sparkplug spec)
 	bdSeqMetric := &sparkplugb.Payload_Metric{
-		Name:  func() *string { s := "bdSeq"; return &s }(),
+		Name: func() *string { s := "bdSeq"; return &s }(),
 		Value: &sparkplugb.Payload_Metric_LongValue{
 			LongValue: s.bdSeq,
 		},
@@ -1350,7 +1360,7 @@ func (s *sparkplugOutput) publishBirthMessage() error {
 
 	// Add Node Control/Rebirth metric (required by Sparkplug spec for Edge Nodes)
 	nodeControlMetric := &sparkplugb.Payload_Metric{
-		Name:  func() *string { s := "Node Control/Rebirth"; return &s }(),
+		Name: func() *string { s := "Node Control/Rebirth"; return &s }(),
 		Value: &sparkplugb.Payload_Metric_BooleanValue{
 			BooleanValue: false, // Always false in NBIRTH
 		},
@@ -1595,6 +1605,13 @@ func (s *sparkplugOutput) publishDataMessage(data map[string]interface{}, msg *s
 		s.setMetricValue(metric, value, metricType)
 		s.logger.Debugf("About to call setMetricTimestamp for metric: %s", metricName)
 		s.setMetricTimestamp(metric, msg)
+		if s.historicalAgeThreshold > 0 && metric.Timestamp != nil {
+			metricTime := time.UnixMilli(int64(*metric.Timestamp))
+			if time.Since(metricTime) > s.historicalAgeThreshold {
+				isHistorical := true
+				metric.IsHistorical = &isHistorical
+			}
+		}
 		metrics = append(metrics, metric)
 
 		if s.retainLastValues {
