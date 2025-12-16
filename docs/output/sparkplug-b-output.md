@@ -2,7 +2,7 @@
 
 ## Overview
 
-The **Sparkplug B Output plugin** allows the United Manufacturing Hub (UMH) to publish industrial IoT data to MQTT brokers using the Sparkplug B specification. It acts as an **Edge Node** in the Sparkplug B ecosystem, converting UMH-Core messages into standardized MQTT-based Sparkplug B protocol with protobuf encoding and alias management.
+The **Sparkplug B Output plugin** allows the United Manufacturing Hub (UMH) to publish industrial IoT data to MQTT brokers using the Sparkplug B specification. It acts as an **Edge Node** in the Sparkplug B ecosystem, converting UMH-Core messages into standardized MQTT-based Sparkplug B protocol with protobuf encoding and alias management (configurable to use full metric names instead of aliases).
 
 Sparkplug B is an open standard for MQTT-based industrial IoT communication that minimizes bandwidth usage through metric aliases and efficient protobuf encoding. 
 
@@ -135,6 +135,7 @@ Each metric in the `metrics` array supports:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `behaviour.auto_extract_tag_name` | `bool` | `true` | Whether to automatically extract tag_name from message metadata |
+| `behaviour.use_aliases` | `bool` | `true` | Publish metrics using numeric aliases (false sends full metric names in every message) |
 | `behaviour.retain_last_values` | `bool` | `true` | Whether to retain last known values for BIRTH messages after reconnection |
 | `behaviour.dbirth_buffer` | `duration` | `"500ms"` | Wait time before publishing DBIRTH when new metrics are discovered (batches bursts after restart, set to `0s` to disable) |
 
