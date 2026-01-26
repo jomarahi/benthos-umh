@@ -500,6 +500,33 @@ func (s *sparkplugOutput) Connect(ctx context.Context) error {
 	return nil
 }
 
+func (s *sparkplugOutput) mqttOpTimeout() time.Duration {
+	if s.client != nil {
+		optsReader := s.client.OptionsReader()
+		if t := (&optsReader).WriteTimeout(); t > 0 {
+			return t
+		}
+		if t := (&optsReader).ConnectTimeout(); t > 0 {
+			return t
+		}
+	}
+	if s.config.MQTT.ConnectTimeout > 0 {
+		return s.config.MQTT.ConnectTimeout
+	}
+	return 30 * time.Second
+}
+
+func (s *sparkplugOutput) waitMQTTToken(token mqtt.Token, operation string) error {
+	timeout := s.mqttOpTimeout()
+	if !token.WaitTimeout(timeout) {
+		return fmt.Errorf("%s timeout after %v", operation, timeout)
+	}
+	if err := token.Error(); err != nil {
+		return fmt.Errorf("%s failed: %w", operation, err)
+	}
+	return nil
+}
+
 func (s *sparkplugOutput) onConnect(client mqtt.Client) {
 	s.logger.Info("MQTT client connected, publishing BIRTH message")
 
@@ -539,8 +566,8 @@ func (s *sparkplugOutput) onConnect(client mqtt.Client) {
 	s.logger.Infof("Subscribing to node rebirth commands on topic: %s", ncmdTopic)
 
 	token := client.Subscribe(ncmdTopic, 1, s.handleRebirthCommand)
-	if token.Wait() && token.Error() != nil {
-		s.logger.Errorf("Failed to subscribe to rebirth commands: %v", token.Error())
+	if err := s.waitMQTTToken(token, "subscribe to rebirth commands"); err != nil {
+		s.logger.Errorf("Failed to subscribe to rebirth commands: %v", err)
 		s.publishErrors.Incr(1)
 	} else {
 		s.logger.Info("Successfully subscribed to node rebirth commands")
@@ -1322,9 +1349,12 @@ func (s *sparkplugOutput) publishDBIRTH(deviceID string, data map[string]interfa
 	}
 
 	// DBIRTH messages MUST be retained per Sparkplug B specification
+	if s.client == nil || !s.client.IsConnected() {
+		return fmt.Errorf("failed to publish DBIRTH message: MQTT client not connected")
+	}
 	token := s.client.Publish(topic, s.config.MQTT.QoS, true, payloadBytes)
-	if token.Wait() && token.Error() != nil {
-		return fmt.Errorf("failed to publish DBIRTH message: %w", token.Error())
+	if err := s.waitMQTTToken(token, "publish DBIRTH"); err != nil {
+		return err
 	}
 
 	s.logger.Infof("Published retained DBIRTH message on topic: %s", topic)
@@ -1426,9 +1456,12 @@ func (s *sparkplugOutput) publishBirthMessage() error {
 
 	// BIRTH messages MUST be retained per Sparkplug B specification
 	// This allows Primary Hosts to receive current state when they connect
+	if s.client == nil || !s.client.IsConnected() {
+		return fmt.Errorf("failed to publish BIRTH message: MQTT client not connected")
+	}
 	token := s.client.Publish(topic, s.config.MQTT.QoS, true, payloadBytes)
-	if token.Wait() && token.Error() != nil {
-		return fmt.Errorf("failed to publish BIRTH message: %w", token.Error())
+	if err := s.waitMQTTToken(token, "publish BIRTH"); err != nil {
+		return err
 	}
 
 	s.logger.Infof("Published retained BIRTH message on topic: %s", topic)
@@ -1483,6 +1516,15 @@ func (s *sparkplugOutput) extractMessageData(msg *service.Message) (map[string]i
 					}
 				} else {
 					s.logger.Debugf("extractMessageData: tag_name %s found but no virtual_path metadata for metric generation", tagName)
+					// Added Jørgen Antonsen 19.12.2025
+					metricName := tagName
+					if value, err := s.extractValueFromPath(structured, tagName); err == nil {
+						data[metricName] = value
+						s.logger.Debugf("extractMessageData: Successfully extracted value for generated metric %s: %v", metricName, value)
+					} else {
+						s.logger.Debugf("extractMessageData: Failed to extract value for generated metric %s from path %s: %v", metricName, tagName, err)
+					}
+					// end
 				}
 			}
 		} else {
@@ -1637,9 +1679,12 @@ func (s *sparkplugOutput) publishDataMessage(data map[string]interface{}, msg *s
 		return fmt.Errorf("failed to marshal DATA payload: %w", err)
 	}
 
+	if s.client == nil || !s.client.IsConnected() {
+		return fmt.Errorf("failed to publish DATA message: MQTT client not connected")
+	}
 	token := s.client.Publish(topic, s.config.MQTT.QoS, false, payloadBytes)
-	if token.Wait() && token.Error() != nil {
-		return fmt.Errorf("failed to publish DATA message: %w", token.Error())
+	if err := s.waitMQTTToken(token, "publish DATA"); err != nil {
+		return err
 	}
 
 	s.logger.Debugf("Published DATA message with %d metrics on topic: %s", len(metrics), topic)

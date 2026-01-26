@@ -113,7 +113,7 @@ func (ac *AliasCache) ResolveAliases(deviceKey string, metrics []*sparkplugb.Pay
 		ac.mu.RUnlock()
 		return 0
 	}
-	
+
 	// Create a copy of the alias map to avoid holding the lock during metric updates
 	aliasMapCopy := make(map[uint64]string, len(aliasMap))
 	for k, v := range aliasMap {
@@ -816,7 +816,13 @@ func (mcb *MQTTClientBuilder) CreateClient(config MQTTClientConfig) (mqtt.Client
 	opts.SetClientID(config.ClientID)
 	opts.SetKeepAlive(config.KeepAlive)
 	opts.SetConnectTimeout(config.ConnectTimeout)
+	// Prevent operations from blocking indefinitely on dead connections.
+	// This timeout also becomes our default upper bound for token waits.
+	opts.SetWriteTimeout(config.ConnectTimeout)
 	opts.SetCleanSession(config.CleanSession)
+	// Be explicit about reconnect behaviour. Paho defaults AutoReconnect=true,
+	// but setting it here ensures consistent behaviour across versions/config.
+	opts.SetAutoReconnect(true)
 
 	// Set authentication if provided
 	if config.Username != "" {
@@ -882,10 +888,27 @@ func (mcb *MQTTClientBuilder) ConnectWithRetry(client mqtt.Client, timeout time.
 
 // PublishWithMetrics publishes a message with automatic metrics tracking.
 func (mcb *MQTTClientBuilder) PublishWithMetrics(client mqtt.Client, topic string, qos byte, retained bool, payload interface{}) error {
-	token := client.Publish(topic, qos, retained, payload)
-	if token.Wait() && token.Error() != nil {
+	if client == nil || !client.IsConnected() {
 		mcb.metrics.PublishFailures.Incr(1)
-		return token.Error()
+		return fmt.Errorf("MQTT publish failed: client not connected")
+	}
+	optsReader := client.OptionsReader()
+	timeout := (&optsReader).WriteTimeout()
+	if timeout <= 0 {
+		timeout = (&optsReader).ConnectTimeout()
+	}
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+
+	token := client.Publish(topic, qos, retained, payload)
+	if !token.WaitTimeout(timeout) {
+		mcb.metrics.PublishFailures.Incr(1)
+		return fmt.Errorf("MQTT publish timeout after %v", timeout)
+	}
+	if err := token.Error(); err != nil {
+		mcb.metrics.PublishFailures.Incr(1)
+		return err
 	}
 
 	mcb.metrics.MessagesPublished.Incr(1)
@@ -894,6 +917,19 @@ func (mcb *MQTTClientBuilder) PublishWithMetrics(client mqtt.Client, topic strin
 
 // SubscribeWithMetrics subscribes to topics with automatic metrics tracking.
 func (mcb *MQTTClientBuilder) SubscribeWithMetrics(client mqtt.Client, topicFilter string, qos byte, callback mqtt.MessageHandler) error {
+	if client == nil || !client.IsConnected() {
+		mcb.metrics.SubscriptionErrors.Incr(1)
+		return fmt.Errorf("MQTT subscribe failed: client not connected")
+	}
+	optsReader := client.OptionsReader()
+	timeout := (&optsReader).WriteTimeout()
+	if timeout <= 0 {
+		timeout = (&optsReader).ConnectTimeout()
+	}
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+
 	// Wrap the callback with metrics
 	wrappedCallback := func(client mqtt.Client, msg mqtt.Message) {
 		mcb.metrics.MessagesReceived.Incr(1)
@@ -901,9 +937,13 @@ func (mcb *MQTTClientBuilder) SubscribeWithMetrics(client mqtt.Client, topicFilt
 	}
 
 	token := client.Subscribe(topicFilter, qos, wrappedCallback)
-	if token.Wait() && token.Error() != nil {
+	if !token.WaitTimeout(timeout) {
 		mcb.metrics.SubscriptionErrors.Incr(1)
-		return token.Error()
+		return fmt.Errorf("MQTT subscribe timeout after %v", timeout)
+	}
+	if err := token.Error(); err != nil {
+		mcb.metrics.SubscriptionErrors.Incr(1)
+		return err
 	}
 
 	mcb.logger.Debugf("Successfully subscribed to MQTT topic: %s", topicFilter)

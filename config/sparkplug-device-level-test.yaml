@@ -19,6 +19,7 @@
 input:
   generate:
     interval: "2s"
+    auto_replay_nacks: true
     mapping: |
       root = {
         "counter": counter()
@@ -48,7 +49,7 @@ pipeline:
             // Simulate humidity data
             msg.payload = 60.0 + (counterValue % 20);
           }
-
+          console.log(msg.payload)
           return msg;
 
 output:
@@ -66,7 +67,7 @@ output:
             # device_id will be generated from location_path via PARRIS Method
 
           # Configure as Edge Node (publishes data)
-          role: "edge_node"
+          # role: "edge_node"
 
 logger:
   level: "DEBUG"

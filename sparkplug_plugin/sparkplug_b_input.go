@@ -1097,9 +1097,8 @@ func (s *sparkplugInput) sendRebirthRequest(deviceKey string) {
 		return
 	}
 
-	token := s.client.Publish(topic, s.config.MQTT.QoS, false, payloadBytes)
-	if token.Wait() && token.Error() != nil {
-		s.logger.Errorf("Failed to publish rebirth command: %v", token.Error())
+	if err := s.mqttClientBuilder.PublishWithMetrics(s.client, topic, s.config.MQTT.QoS, false, payloadBytes); err != nil {
+		s.logger.Errorf("Failed to publish rebirth command: %v", err)
 		return
 	}
 
